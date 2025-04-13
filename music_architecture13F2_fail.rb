@@ -1,0 +1,551 @@
+require 'sketchup.rb'
+require 'json'
+
+module MusicArchitecture
+  @versions = []
+  @current_version_index = nil
+  @current_note = 'HN'
+  @dialog = nil
+  @current_reference_point = Geom::Point3d.new(0, 0, 0)
+  @placement_history = []
+  @last_save_time = 0
+  @pending_updates = false
+
+  NOTE_TYPES = {
+    'FN' => { name: 'Full Note', factor: 1.0 },
+    'HN' => { name: 'Half Note', factor: 0.5 },
+    'QN' => { name: 'Quarter Note', factor: 0.25 },
+    'EN' => { name: 'Eighth Note', factor: 0.125 },
+    'SN' => { name: 'Sixteenth Note', factor: 0.0625 }
+  }
+
+  DIR_MAP = {
+    'X+' => { left: 'Y+', right: 'Y-', reverse: 'X-' },
+    'Y+' => { left: 'X-', right: 'X+', reverse: 'Y-' },
+    'X-' => { left: 'Y-', right: 'Y+', reverse: 'X+' },
+    'Y-' => { left: 'X+', right: 'X-', reverse: 'Y+' },
+    'Z' => { left: 'Z', right: 'Z', reverse: 'Z' }
+  }
+
+  def self.mm_to_inch(mm)
+    mm / 25.4
+  end
+
+  def self.inch_to_mm(inch)
+    inch * 25.4
+  end
+
+  unless file_loaded?(__FILE__)
+    UI.menu('Plugins').add_item('Show Music Architecture Panel') { show_panel }
+    file_loaded(__FILE__)
+  end
+
+  def self.show_panel
+    if @dialog.nil? || !@dialog.visible?
+      @dialog = UI::HtmlDialog.new(
+        dialog_title: 'Music Architecture',
+        preferences_key: 'MusicArchitecturePanel',
+        width: 400,
+        height: 900,
+        left: 100,
+        top: 100,
+        resizable: true
+      )
+      @dialog.set_html(get_html_content)
+      @dialog.add_action_callback('createNewGroup') { |_, params| create_new_group(params) }
+      @dialog.add_action_callback('updateCurrentGroup') { |_, params| update_current_group(params) }
+      @dialog.add_action_callback('switchGroup') { |_, direction| switch_group(direction) }
+      @dialog.add_action_callback('setReferencePoint') { |_, x, y, z| set_reference_point(x, y, z) }
+      @dialog.add_action_callback('placeNote') { |_, key| place_note(key) }
+      @dialog.add_action_callback('setNoteType') { |_, key| set_note_type(key) }
+      @dialog.add_action_callback('advanceReferencePoint') { |_| advance_reference_point }
+      @dialog.add_action_callback('syncSpacing') { |_| sync_spacing }
+      @dialog.add_action_callback('loadGroups') { |_| load_groups_from_model }
+      @dialog.add_action_callback('resetReferencePoint') { |_| reset_reference_point }
+      @dialog.add_action_callback('getReferencePoint') { |_| get_reference_point_from_selection }
+      @dialog.add_action_callback('reverseSpacing') { |_| reverse_spacing }
+      @dialog.add_action_callback('adjustDimension') { |_, dimension, delta| adjust_dimension(dimension, delta) }
+      @dialog.add_action_callback('reduceHalfDimension') { |_, dimension| reduce_half_dimension(dimension) }
+      @dialog.add_action_callback('changeDirection') { |_, action| update_group_direction(action, true) }
+      @dialog.add_action_callback('setGroupDirection') { |_, dir| update_group_direction(dir) }
+      @dialog.add_action_callback('deleteCurrentGroup') { |_| delete_current_group }
+      @dialog.add_action_callback('toggleKeyboard') { |_, enable| puts "键盘操作: #{enable ? '启用' : '禁用'}" }
+      @dialog.show
+    end
+  end
+
+  def self.process_group_params(params, defaults = { length: 3000.0, width: 100.0, height: 3000.0, spacing: 3000.0 })
+    {
+      length: mm_to_inch(params['length'].to_f > 0 ? params['length'].to_f : defaults[:length]),
+      width: mm_to_inch(params['width'].to_f > 0 ? params['width'].to_f : defaults[:width]),
+      height: mm_to_inch(params['height'].to_f > 0 ? params['height'].to_f : defaults[:height]),
+      advance_dir: params['advance_dir'] || 'X+',
+      rotation_axis: params['rotation_axis'] || 'Z',
+      base_spacing: mm_to_inch(params['spacing'].to_f > 0 ? params['spacing'].to_f : defaults[:spacing]),
+      standard_length: mm_to_inch(params['length'].to_f > 0 ? params['length'].to_f : defaults[:length]),
+      standard_width: mm_to_inch(params['width'].to_f > 0 ? params['width'].to_f : defaults[:width]),
+      standard_height: mm_to_inch(params['height'].to_f > 0 ? params['height'].to_f : defaults[:height]),
+      standard_spacing: mm_to_inch(params['spacing'].to_f > 0 ? params['spacing'].to_f : defaults[:spacing])
+    }
+  end
+
+  def self.create_new_group(params)
+    group_id = @versions.size + 1
+    group_data = process_group_params(params).merge(id: group_id, reference_point: @current_reference_point)
+    puts "创建组：ID=#{group_id}, 长度=#{inch_to_mm(group_data[:length])}, 间距=#{inch_to_mm(group_data[:base_spacing])}"
+    @versions << group_data
+    @current_version_index = @versions.size - 1
+    save_and_update(group_data)
+  end
+
+  def self.update_current_group(params)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    defaults = {
+      length: inch_to_mm(group[:length]),
+      width: inch_to_mm(group[:width]),
+      height: inch_to_mm(group[:height]),
+      spacing: inch_to_mm(group[:base_spacing])
+    }
+    updated_data = process_group_params(params, defaults)
+    group.merge!(updated_data)
+    puts "更新组：ID=#{group[:id]}, 长度=#{inch_to_mm(group[:length])}, 间距=#{inch_to_mm(group[:base_spacing])}"
+    save_and_update(group)
+  end
+
+  def self.switch_group(direction)
+    return unless @current_version_index
+    @current_version_index += (direction == 'prev' ? -1 : 1) if (0...@versions.size).include?(@current_version_index + (direction == 'prev' ? -1 : 1))
+    group = @versions[@current_version_index]
+    @current_reference_point = Geom::Point3d.new(group[:reference_point])
+    highlight_current_group
+    update_panel_display
+  end
+
+  def self.set_reference_point(x, y, z)
+    return unless @current_version_index
+    @current_reference_point = Geom::Point3d.new(mm_to_inch(x.to_f), mm_to_inch(y.to_f), mm_to_inch(z.to_f))
+    group = @versions[@current_version_index]
+    group[:reference_point] = @current_reference_point
+    save_and_update(group)
+  end
+
+  def self.create_note_components(group)
+    model = Sketchup.active_model
+    definitions = model.definitions
+    NOTE_TYPES.each do |type, data|
+      component_name = "#{type}_v#{group[:id]}"
+      definition = definitions[component_name] || definitions.add(component_name)
+      definition.entities.clear!
+      length = group[:length] * data[:factor]
+      create_rectangle(definition, length, group[:width], group[:height])
+    end
+  end
+
+  def self.create_rectangle(definition, length, width, height)
+    entities = definition.entities
+    points = [
+      [-length / 2, -width / 2, -height / 2],
+      [length / 2, -width / 2, -height / 2],
+      [length / 2, width / 2, -height / 2],
+      [-length / 2, width / 2, -height / 2]
+    ]
+    face = entities.add_face(points)
+    face.pushpull(height)
+  end
+
+  def self.place_note(key)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    note_map = { 'z' => 0, 's' => 15, 'x' => 30, 'd' => 45, 'c' => 60, 'v' => 75, 'g' => 90, 'b' => 105, 'h' => 120, 'n' => 135, 'j' => 150, 'm' => 165 }
+    angle = note_map[key]
+    model = Sketchup.active_model
+    entities = model.active_entities
+    definition = model.definitions["#{@current_note}_v#{group[:id]}"]
+    
+    advance_reference_point(false)
+    instance = entities.add_instance(definition, @current_reference_point)
+
+    if group[:advance_dir] == 'X+' || group[:advance_dir] == 'X-'
+      instance.transform!(Geom::Transformation.rotation(@current_reference_point, [0, 0, 1], 90.degrees))
+    elsif group[:advance_dir] == 'Z'
+      instance.transform!(Geom::Transformation.rotation(@current_reference_point, [0, 1, 0], 90.degrees))
+    end
+
+    axis = { 'X' => [1, 0, 0], 'Y' => [0, 1, 0], 'Z' => [0, 0, 1] }[group[:rotation_axis]]
+    instance.transform!(Geom::Transformation.rotation(@current_reference_point, axis, angle.degrees))
+
+    @placement_history << { instance: instance, note_type: @current_note }
+    schedule_save_and_update(group)
+  end
+
+  def self.advance_reference_point(save = true)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    spacing = group[:base_spacing].abs * NOTE_TYPES[@current_note][:factor]
+    puts "间距计算：base_spacing=#{inch_to_mm(group[:base_spacing])}, note=#{@current_note}, spacing=#{inch_to_mm(spacing)}"
+    
+    vector = {
+      'X+' => [spacing, 0, 0], 'X-' => [-spacing, 0, 0],
+      'Y+' => [0, spacing, 0], 'Y-' => [0, -spacing, 0],
+      'Z' => [0, 0, spacing]
+    }[group[:advance_dir]]
+    @current_reference_point += vector
+    group[:reference_point] = @current_reference_point
+    schedule_save_and_update(group) if save
+  end
+
+  def self.set_note_type(key)
+    @current_note = { '1' => 'FN', '2' => 'HN', '3' => 'QN', '4' => 'EN', '5' => 'SN' }[key]
+    puts "设置音符类型：#{@current_note}"
+  end
+
+  def self.sync_spacing
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    group[:base_spacing] = group[:length]
+    group[:standard_spacing] = group[:base_spacing].abs
+    puts "同步间距：长度=#{inch_to_mm(group[:length])}, 间距=#{inch_to_mm(group[:base_spacing])}"
+    save_and_update(group)
+  end
+
+  def self.reverse_spacing
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    group[:advance_dir] = DIR_MAP[group[:advance_dir]][:reverse]
+    group[:base_spacing] *= -1
+    group[:standard_spacing] = group[:base_spacing].abs
+    puts "反向间距：方向=#{group[:advance_dir]}, 间距=#{inch_to_mm(group[:base_spacing])}"
+    save_and_update(group)
+  end
+
+  def self.adjust_dimension(dimension, delta)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    standard = group["standard_#{dimension}".to_sym]
+    group[dimension.to_sym] += standard * delta
+    puts "调整#{dimension}：#{inch_to_mm(group[dimension.to_sym])}, 标准值：#{inch_to_mm(standard)}"
+    save_and_update(group)
+  end
+
+  def self.reduce_half_dimension(dimension)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    group[dimension.to_sym] /= 2.0
+    group["standard_#{dimension}".to_sym] = group[dimension.to_sym]
+    puts "减半#{dimension}：#{inch_to_mm(group[dimension.to_sym])}, 新标准值：#{inch_to_mm(group["standard_#{dimension}".to_sym])}"
+    save_and_update(group)
+  end
+
+  def self.update_group_direction(new_dir, is_rotation = false)
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    return if group[:advance_dir] == 'Z' && is_rotation
+
+    new_group = group.dup
+    new_group[:id] = @versions.size + 1
+    new_group[:reference_point] = @current_reference_point
+
+    if is_rotation
+      new_group[:advance_dir] = DIR_MAP[group[:advance_dir]][new_dir.to_sym]
+    else
+      new_group[:advance_dir] = new_dir
+    end
+
+    puts "方向切换：#{group[:advance_dir]} -> #{new_group[:advance_dir]}, 新组ID：#{new_group[:id]}"
+    @versions << new_group
+    @current_version_index = @versions.size - 1
+    save_and_update(new_group)
+  end
+
+  def self.undo_last_placement
+    return unless @placement_history.any?
+    last = @placement_history.pop
+    last[:instance].erase!
+    group = @versions[@current_version_index]
+    spacing = group[:base_spacing].abs * NOTE_TYPES[last[:note_type]][:factor]
+    vector = {
+      'X+' => [-spacing, 0, 0], 'X-' => [spacing, 0, 0],
+      'Y+' => [0, -spacing, 0], 'Y-' => [0, spacing, 0],
+      'Z' => [0, 0, -spacing]
+    }[group[:advance_dir]]
+    @current_reference_point += vector
+    group[:reference_point] = @current_reference_point
+    save_and_update(group)
+  end
+
+  def self.get_reference_point_from_selection
+    model = Sketchup.active_model
+    selection = model.selection
+    return UI.messagebox('请选中一个组件') if selection.empty? || !selection.first.is_a?(Sketchup::ComponentInstance)
+    
+    @current_reference_point = selection.first.transformation.origin
+    group = @versions[@current_version_index]
+    group[:reference_point] = @current_reference_point
+    save_and_update(group)
+  end
+
+  def self.reset_reference_point
+    return unless @current_version_index
+    @current_reference_point = Geom::Point3d.new(0, 0, 0)
+    group = @versions[@current_version_index]
+    group[:reference_point] = @current_reference_point
+    save_and_update(group)
+  end
+
+  def self.delete_current_group
+    return unless @current_version_index
+    group = @versions[@current_version_index]
+    model = Sketchup.active_model
+    %w[FN HN QN EN SN].each do |type|
+      model.definitions.remove(model.definitions["#{type}_v#{group[:id]}"])
+    end
+    component_name = "GroupData_#{group[:id]}"
+    instance = model.entities.grep(Sketchup::ComponentInstance).find { |i| i.definition.name == component_name }
+    model.entities.erase_entities(instance) if instance
+    
+    @versions.delete_at(@current_version_index)
+    @current_version_index = @versions.empty? ? nil : [@current_version_index, @versions.size - 1].min
+    puts "删除组：ID=#{group[:id]}"
+    update_panel_display
+  end
+
+  def self.highlight_current_group
+    model = Sketchup.active_model
+    highlight = model.materials.add('Highlight')
+    highlight.color = Sketchup::Color.new(150, 150, 255)
+    default = model.materials.add('Default')
+    default.color = Sketchup::Color.new(255, 255, 255)
+    
+    @versions.each_with_index do |group, index|
+      material = index == @current_version_index ? highlight : default
+      model.definitions.each do |defn|
+        next unless defn.name.end_with?("_v#{group[:id]}")
+        defn.entities.grep(Sketchup::Face).each { |face| face.material = material }
+      end
+    end
+  end
+
+  def self.save_group_to_model(group)
+    model = Sketchup.active_model
+    component_name = "GroupData_#{group[:id]}"
+    definition = model.definitions[component_name] || model.definitions.add(component_name)
+    instance = model.entities.grep(Sketchup::ComponentInstance).find { |i| i.definition.name == component_name } ||
+               model.entities.add_instance(definition, [0, 0, 0])
+    instance.hidden = true
+    instance.set_attribute('MusicArch', 'data', group.to_json)
+  end
+
+  def self.load_groups_from_model
+    model = Sketchup.active_model
+    @versions = model.entities.grep(Sketchup::ComponentInstance)
+                     .select { |e| e.definition.name.start_with?('GroupData_') }
+                     .map { |e| JSON.parse(e.get_attribute('MusicArch', 'data'), symbolize_names: true) }
+                     .map { |g| g.merge(reference_point: Geom::Point3d.new(g[:reference_point])) }
+                     .sort_by { |g| g[:id] }
+    @current_version_index = @versions.any? ? 0 : nil
+    update_panel_display if @versions.any?
+  end
+
+  def self.schedule_save_and_update(group)
+    @pending_updates = true
+    current_time = Time.now.to_f
+    return if current_time - @last_save_time < 1.0
+
+    @last_save_time = current_time
+    save_group_to_model(group)
+    update_panel_display
+    @pending_updates = false
+  end
+
+  def self.save_and_update(group)
+    create_note_components(group) if group[:length] || group[:width] || group[:height]
+    save_group_to_model(group)
+    update_panel_display
+  end
+
+  def self.update_panel_display
+    if @current_version_index
+      group = @versions[@current_version_index]
+      commands = [
+        "document.getElementById('group_id').innerText = 'Group #{group[:id]}';",
+        "document.getElementById('length').value = '#{inch_to_mm(group[:length]).round}';",
+        "document.getElementById('width').value = '#{inch_to_mm(group[:width]).round}';",
+        "document.getElementById('height').value = '#{inch_to_mm(group[:height]).round}';",
+        "document.getElementById('advance_dir').value = '#{group[:advance_dir]}';",
+        "document.getElementById('rotation_axis').value = '#{group[:rotation_axis]}';",
+        "document.getElementById('spacing').value = '#{inch_to_mm(group[:base_spacing]).round}';",
+        "document.getElementById('ref_x').value = '#{inch_to_mm(group[:reference_point].x).round}';",
+        "document.getElementById('ref_y').value = '#{inch_to_mm(group[:reference_point].y).round}';",
+        "document.getElementById('ref_z').value = '#{inch_to_mm(group[:reference_point].z).round}';"
+      ]
+    else
+      commands = [
+        "document.getElementById('group_id').innerText = '未选择';",
+        "document.getElementById('length').value = '3000';",
+        "document.getElementById('width').value = '100';",
+        "document.getElementById('height').value = '3000';",
+        "document.getElementById('advance_dir').value = 'X+';",
+        "document.getElementById('rotation_axis').value = 'Z';",
+        "document.getElementById('spacing').value = '3000';",
+        "document.getElementById('ref_x').value = '0';",
+        "document.getElementById('ref_y').value = '0';",
+        "document.getElementById('ref_z').value = '0';"
+      ]
+    ]
+    commands.each { |cmd| @dialog.execute_script(cmd) }
+  end
+
+  def self.get_html_content
+    <<~HTML
+      <html>
+      <body>
+        <h2>Music Architecture 面板</h2>
+        <p>当前组: <span id="group_id">未选择</span></p>
+        <button onclick="loadGroups()">读取组数据</button>
+        <button onclick="deleteCurrentGroup()">删除当前组</button>
+        <button id="enableKeyboard" onclick="toggleKeyboard(true)">启用键盘操作</button>
+        <button id="disableKeyboard" onclick="toggleKeyboard(false)">禁用键盘操作</button>
+        <form id="paramsForm">
+          <label>长度 (mm): <input type="number" id="length" value="3000"></label><br>
+          <label>宽度 (mm): <input type="number" id="width" value="100"></label><br>
+          <label>高度 (mm): <input type="number" id="height" value="3000"></label><br>
+          <label>行进方向:
+            <input type="text" id="advance_dir" value="X+" readonly style="width: 50px;">
+            <button type="button" onclick="setDirection('X+')">X+</button>
+            <button type="button" onclick="setDirection('Y+')">Y+</button>
+            <button type="button" onclick="setDirection('X-')">X-</button>
+            <button type="button" onclick="setDirection('Y-')">Y-</button>
+            <button type="button" onclick="setDirection('Z')">Z</button>
+          </label><br>
+          <label>旋转轴:
+            <input type="text" id="rotation_axis" value="Z" readonly style="width: 30px;">
+            <button type="button" onclick="setRotationAxis('X')">X</button>
+            <button type="button" onclick="setRotationAxis('Y')">Y</button>
+            <button type="button" onclick="setRotationAxis('Z')">Z</button>
+          </label><br>
+          <label>标准间距 (mm): <input type="number" id="spacing" value="3000"></label><br>
+          <button type="button" onclick="createNewGroup()">创建新组</button>
+          <button type="button" onclick="updateCurrentGroup()">保存到当前组</button>
+          <button type="button" onclick="syncSpacing()">同步间距与长度</button>
+          <button type="button" onclick="reverseSpacing()">反向间距</button>
+          <button type="button" onclick="adjustDimension('length', 1)">+1倍长度</button>
+          <button type="button" onclick="adjustDimension('length', -1)">-1倍长度</button>
+          <button type="button" onclick="reduceHalfDimension('length')">长度减半</button>
+          <button type="button" onclick="adjustDimension('width', 1)">+1倍宽度</button>
+          <button type="button" onclick="adjustDimension('width', -1)">-1倍宽度</button>
+          <button type="button" onclick="reduceHalfDimension('width')">宽度减半</button>
+          <button type="button" onclick="adjustDimension('height', 1)">+1倍高度</button>
+          <button type="button" onclick="adjustDimension('height', -1)">-1倍高度</button>
+          <button type="button" onclick="reduceHalfDimension('height')">高度减半</button>
+          <button type="button" onclick="adjustDimension('base_spacing', 1)">+1倍间距</button>
+          <button type="button" onclick="adjustDimension('base_spacing', -1)">-1倍间距</button>
+          <button type="button" onclick="reduceHalfDimension('base_spacing')">间距减半</button>
+          <button type="button" onclick="changeDirection('left')">左转</button>
+          <button type="button" onclick="changeDirection('right')">右转</button>
+          <button type="button" onclick="undoLastPlacement()">回退</button>
+        </form>
+        <h3>当前参考点 (mm)</h3>
+        <p>X: <input type="number" id="ref_x" value="0"></p>
+        <p>Y: <input type="number" id="ref_y" value="0"></p>
+        <p>Z: <input type="number" id="ref_z" value="0"></p>
+        <button onclick="updateReferencePoint()">更新参考点</button>
+        <button onclick="resetReferencePoint()">重置参考点</button>
+        <button onclick="getReferencePoint()">获取参考点</button>
+        <button onclick="switchGroup('prev')">前一组</button>
+        <button onclick="switchGroup('next')">后一组</button>
+        <h3>放置音符</h3>
+        <button onclick="placeNote('z')">C (0°)</button>
+        <button onclick="placeNote('s')">#C (15°)</button>
+        <button onclick="placeNote('x')">D (30°)</button>
+        <button onclick="placeNote('d')">#D (45°)</button>
+        <button onclick="placeNote('c')">E (60°)</button>
+        <button onclick="placeNote('v')">F (75°)</button>
+        <button onclick="placeNote('g')">#F (90°)</button>
+        <button onclick="placeNote('b')">G (105°)</button>
+        <button onclick="placeNote('h')">#G (120°)</button>
+        <button onclick="placeNote('n')">A (135°)</button>
+        <button onclick="placeNote('j')">#A (150°)</button>
+        <button onclick="placeNote('m')">B (165°)</button>
+        <h3>选择音符类型</h3>
+        <button onclick="setNoteType('1')">FN (全音符)</button>
+        <button onclick="setNoteType('2')">HN (二分音符)</button>
+        <button onclick="setNoteType('3')">QN (四分音符)</button>
+        <button onclick="setNoteType('4')">EN (八分音符)</button>
+        <button onclick="setNoteType('5')">SN (十六分音符)</button>
+        <h3>空拍</h3>
+        <button onclick="advanceReferencePoint()">空拍 (0)</button>
+      </body>
+      <script>
+        var keyboardEnabled = false;
+        var keyHandler = function(e) {
+          var key = e.key.toLowerCase();
+          var validKeys = ['z', 's', 'x', 'd', 'c', 'v', 'g', 'b', 'h', 'n', 'j', 'm', '0', ' ', '1', '2', '3', '4', '5'];
+          if (validKeys.includes(key)) {
+            console.log('捕获按键: ' + key);
+            if (key === '0' || key === ' ') {
+              sketchup.advanceReferencePoint();
+            } else if (['1', '2', '3', '4', '5'].includes(key)) {
+              sketchup.setNoteType(key);
+            } else {
+              sketchup.placeNote(key);
+            }
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        };
+
+        function toggleKeyboard(enable) {
+          keyboardEnabled = enable;
+          if (enable) {
+            document.addEventListener('keydown', keyHandler);
+            document.getElementById('enableKeyboard').style.backgroundColor = '#90EE90';
+            document.getElementById('disableKeyboard').style.backgroundColor = '';
+          } else {
+            document.removeEventListener('keydown', keyHandler);
+            document.getElementById('enableKeyboard').style.backgroundColor = '';
+            document.getElementById('disableKeyboard').style.backgroundColor = '#FFB6C1';
+          }
+          sketchup.toggleKeyboard(enable);
+        }
+
+        function getParams() {
+          return {
+            length: document.getElementById('length').value,
+            width: document.getElementById('width').value,
+            height: document.getElementById('height').value,
+            advance_dir: document.getElementById('advance_dir').value,
+            rotation_axis: document.getElementById('rotation_axis').value,
+            spacing: document.getElementById('spacing').value
+          };
+        }
+
+        function createNewGroup() { sketchup.createNewGroup(getParams()); }
+        function updateCurrentGroup() { sketchup.updateCurrentGroup(getParams()); }
+        function switchGroup(direction) { sketchup.switchGroup(direction); }
+        function updateReferencePoint() {
+          var x = document.getElementById('ref_x').value;
+          var y = document.getElementById('ref_y').value;
+          var z = document.getElementById('ref_z').value;
+          sketchup.setReferencePoint(x, y, z);
+        }
+        function placeNote(key) { sketchup.placeNote(key); }
+        function setNoteType(key) { sketchup.setNoteType(key); }
+        function advanceReferencePoint() { sketchup.advanceReferencePoint(); }
+        function syncSpacing() { sketchup.syncSpacing(); }
+        function loadGroups() { sketchup.loadGroups(); }
+        function resetReferencePoint() { sketchup.resetReferencePoint(); }
+        function getReferencePoint() { sketchup.getReferencePoint(); }
+        function reverseSpacing() { sketchup.reverseSpacing(); }
+        function adjustDimension(dimension, delta) { sketchup.adjustDimension(dimension, delta); }
+        function reduceHalfDimension(dimension) { sketchup.reduceHalfDimension(dimension); }
+        function changeDirection(action) { sketchup.changeDirection(action); }
+        function undoLastPlacement() { sketchup.undoLastPlacement(); }
+        function setDirection(dir) { sketchup.setGroupDirection(dir); }
+        function setRotationAxis(axis) { document.getElementById('rotation_axis').value = axis; }
+        function deleteCurrentGroup() { sketchup.deleteCurrentGroup(); }
+      </script>
+      </html>
+    HTML
+  end
+end
